@@ -7,9 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import random
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-
+from PIL import Image, ImageTk
+import tkinter as tk
 
 # ===== 可置顶修改的变量 =====
 DEFAULT_CONFIG = {
@@ -135,7 +134,7 @@ def normalize_mods_path(raw_path: str) -> Optional[Path]:
 def ask_mods_path() -> Path:
     while True:
         raw = input(
-            "请输入路径，可为Tabletop Simulator、Tabletop Simulator_Data 或 Mods 文件夹："
+            "请输入 Tabletop Simulator_Data 路径："
         )
 
         mods_path = normalize_mods_path(raw)
@@ -353,33 +352,39 @@ def display_groups(groups: list[GroupInfo]) -> None:
 
 
 def show_images_in_group(group: GroupInfo) -> None:
-    image_files = []
-
-    for file in group.files:
-        path = Path(file.path)
-        if not path.suffix.lower() in IMAGE_EXTENSIONS:
-            continue
-        image_files.append(path)
+    image_files = [
+        Path(file.path)
+        for file in group.files
+        if Path(file.path).suffix.lower() in IMAGE_EXTENSIONS
+    ]
 
     if not image_files:
         print("该分组中没有找到图片文件。")
         return
 
-    selected = random.sample(image_files, min(10, len(image_files)))
-    _, axes = plt.subplots(2, 5, figsize=(10, 4))
-    axes = axes.flatten()
+    selected = random.sample(image_files, min(15, len(image_files)))
 
-    for ax in axes:
-        ax.axis("off")
+    window = tk.Toplevel() if tk._default_root else tk.Tk()
+    window.title(f"分组 {group.id} 图片预览")
 
-    for ax, image_path in zip(axes, selected):
+    thumbs = []
+
+    for index, image_path in enumerate(selected):
         try:
-            img = mpimg.imread(image_path)
-            ax.imshow(img)
+            img = Image.open(image_path)
+            img.thumbnail((180, 180))
+
+            photo = ImageTk.PhotoImage(img)
+            thumbs.append(photo)  # 防止图片被回收
+
+            label = tk.Label(window, image=photo)
+            label.grid(row=index // 5, column=index % 5, padx=8, pady=8)
+
         except Exception as exc:
             print(f"图片读取失败：{image_path} | {exc}")
-    plt.tight_layout()
-    plt.show(block=False)
+
+    window.mainloop()
+
 
 def display_files(groups: list[GroupInfo]) -> None:
     group_id = input_group_id(groups)

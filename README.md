@@ -6,3 +6,7 @@
 - 支持查看分组文件、命名分组、删除分组
 - 自动备份删除文件（保留目录解构，拖回即可恢复）
 - 可自定义时间阈值（在自动创建的json文件中）
+
+使用方法：
+- exe：从 [Releases](https://github.com/ZHXSpaceProgram/tts_manager/releases) 下载
+- python：`python tts_manager.py`
