@@ -4,5 +4,10 @@
 
 - 根据文件创建时间，对Mods中的文件进行分组
 - 支持查看分组文件、命名分组、删除分组
-- 自动备份删除文件（保留目录解构，拖回即可恢复）
+- 自动显示图像预览（随机抽取）
+- 自动备份删除文件（保留目录结构，拖回即可恢复）
 - 可自定义时间阈值（在自动创建的json文件中）
+
+使用方法：
+- exe：从 [Releases](https://github.com/ZHXSpaceProgram/tts_manager/releases) 下载
+- python：`python tts_manager.py`
