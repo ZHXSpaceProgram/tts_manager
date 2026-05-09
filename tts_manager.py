@@ -15,7 +15,7 @@ DEFAULT_CONFIG = {
     "group_threshold_minutes": 60,
     "move_deleted_files_to_backup": True,
 }
-EXCLUDED_TOP_LEVEL_FOLDERS = {"Images Raw", "Models Raw"}
+CACHE_FOLDERS = {"Images Raw", "Models Raw"}
 
 DATA_FILE_NAME = "tts_manager_data.json"
 BACKUP_DIR_NAME = "deleted_files_backup"
@@ -188,7 +188,7 @@ def scan_files(mods_path: Path) -> list[FileInfo]:
     files: list[FileInfo] = []
 
     for top in mods_path.iterdir():
-        if not top.is_dir() or top.name in EXCLUDED_TOP_LEVEL_FOLDERS:
+        if not top.is_dir() or top.name in CACHE_FOLDERS:
             continue
 
         for item in top.rglob("*"):
@@ -474,6 +474,19 @@ def delete_file(path: Path, group: GroupInfo) -> bool:
         return False
 
 
+def clear_cache_folders(mods_path: Path) -> None:
+    for folder_name in CACHE_FOLDERS:
+        folder = mods_path / folder_name
+        if not folder.exists():
+            continue
+        try:
+            shutil.rmtree(folder)
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print(f"清空缓存失败：{folder} | {exc}")
+    print("缓存已清空。")
+
+
 def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
     group_id = input_group_id(groups)
     if group_id is None:
@@ -487,7 +500,7 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
     print(f"将删除分组 [{group.id}] 名称：{name}，文件数：{len(group.files)}")
 
     confirm = input(
-        "确认删除该分组内所有文件吗？此操作不可轻易撤销。(输入 Y 确认)："
+        "确认删除该分组内所有文件吗？(输入 Y 确认)："
     ).strip()
 
     if confirm.upper() != "Y":
@@ -508,6 +521,15 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
 
     print(f"删除完成。成功：{deleted}，失败：{failed}")
 
+    confirm_clear_cache = input(
+        "是否清空缓存文件夹 Images Raw / Models Raw 内的内容？(输入 Y 确认)："
+    ).strip()
+
+    if confirm_clear_cache.upper() == "Y":
+        clear_cache_folders(get_mods_path())
+    else:
+        print("已跳过清空缓存。")
+    
     remaining_old_groups = [g for g in groups if g.id != group_id]
     return refresh_groups(get_mods_path(), remaining_old_groups)
 
