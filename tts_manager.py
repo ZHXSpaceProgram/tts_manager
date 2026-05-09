@@ -49,6 +49,7 @@ DATA_PATH = BASE_DIR / DATA_FILE_NAME
 BACKUP_DIR = BASE_DIR / BACKUP_DIR_NAME
 
 
+# region Time Handling ===================================================================
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -57,6 +58,12 @@ def format_time(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def get_creation_time(path: Path) -> float:
+    return path.stat().st_birthtime if hasattr(path.stat(), "st_birthtime") else path.stat().st_ctime
+# endregion
+
+
+# region Data Handling ==================================================================
 def load_data() -> dict:
     if not DATA_PATH.exists():
         return {}
@@ -108,8 +115,10 @@ def get_config() -> dict:
             DEFAULT_CONFIG["move_deleted_files_to_backup"],
         ),
     }
+# endregion
 
 
+# region Mods Path Handling ==================================================================
 def normalize_mods_path(raw_path: str) -> Optional[Path]:
     raw_path = raw_path.strip().strip('"')
 
@@ -174,14 +183,22 @@ def get_mods_path() -> Path:
 def reset_mods_path() -> Path:
     print("重设 Tabletop Simulator Mods 路径。")
     return ask_mods_path()
+# endregion
 
 
-def get_creation_time(path: Path) -> float:
-    """
-    Windows 上 st_ctime 通常是创建时间。
-    macOS / Linux 上 st_ctime 是元数据变化时间，不一定是真正创建时间。
-    """
-    return path.stat().st_ctime
+# region File Helpers ==================================================================
+
+
+def file_identity(file: FileInfo) -> str:
+    return os.path.normcase(os.path.abspath(file.path))
+
+
+def safe_folder_name(text: str) -> str:
+    text = text.strip() or "unnamed"
+    invalid = '<>:"/\\|?*'
+    for ch in invalid:
+        text = text.replace(ch, "_")
+    return text
 
 
 def scan_files(mods_path: Path) -> list[FileInfo]:
@@ -209,6 +226,19 @@ def scan_files(mods_path: Path) -> list[FileInfo]:
     return sorted(files, key=lambda f: f.created_at)
 
 
+def safe_backup_path(original: Path, group: GroupInfo) -> Path:
+    parts = original.resolve().parts
+    mods_index = parts.index("Mods")
+
+    group_name = safe_folder_name(group.name)
+    group_time = datetime.fromtimestamp(group.created_at).strftime("%Y-%m-%d_%H-%M-%S")
+    group_folder = f"group{group.id}_{group_name}_{group_time}"
+
+    return BACKUP_DIR / group_folder / Path(*parts[mods_index:])
+# endregion
+
+
+# region Grouping Logic ==================================================================
 def make_group(group_id: int, files: list[FileInfo]) -> GroupInfo:
     return GroupInfo(
         id=group_id,
@@ -275,10 +305,6 @@ def save_groups(groups: list[GroupInfo]) -> None:
     save_data(data)
 
 
-def file_identity(file: FileInfo) -> str:
-    return os.path.normcase(os.path.abspath(file.path))
-
-
 def carry_names(old_groups: list[GroupInfo], new_groups: list[GroupInfo]) -> None:
     named_old = [g for g in old_groups if g.name.strip()]
     used_old_ids = set()
@@ -302,6 +328,49 @@ def carry_names(old_groups: list[GroupInfo], new_groups: list[GroupInfo]) -> Non
             used_old_ids.add(best.id)
 
 
+def extract_save_name_from_group(group: GroupInfo) -> str:
+    """
+    从 group 文件中，寻找 mods 路径下 Workshop 子文件夹内的 json 文件，
+    尝试读取其中的 SaveName 字段作为分组名称。
+    """
+    candidates: list[Path] = []
+    for file in group.files:
+        path = Path(file.path)
+        if path.suffix.lower() != ".json":
+            continue
+        # 只接受 Workshop 下的 json 文件
+        parts = path.parts
+        if "Workshop" not in parts:
+            continue
+        candidates.append(path)
+
+    # 优先读取创建时间最早的 json，避免同组多个 json 时结果不稳定
+    candidates.sort(key=lambda p: get_creation_time(p) if p.exists() else 0)
+
+    for json_path in candidates:
+        try:
+            with json_path.open("r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                continue
+            save_name = raw.get("SaveName", "")
+            if isinstance(save_name, str) and save_name.strip():
+                return save_name.strip()
+        except Exception as exc:
+            print(f"警告：读取 Workshop JSON 失败，已跳过：{json_path} | {exc}")
+
+    return ""
+
+
+def auto_name_unnamed_groups(groups: list[GroupInfo]) -> None:
+    for group in groups:
+        if group.name.strip():
+            continue
+        save_name = extract_save_name_from_group(group)
+        if save_name:
+            group.name = save_name
+
+
 def refresh_groups(
     mods_path: Path,
     old_groups: Optional[list[GroupInfo]] = None,
@@ -310,6 +379,8 @@ def refresh_groups(
 
     if old_groups:
         carry_names(old_groups, groups)
+
+    auto_name_unnamed_groups(groups)
 
     save_groups(groups)
     return groups
@@ -440,25 +511,6 @@ def rename_group(groups: list[GroupInfo]) -> None:
     print("已保存分组名称。")
 
 
-def safe_folder_name(text: str) -> str:
-    text = text.strip() or "unnamed"
-    invalid = '<>:"/\\|?*'
-    for ch in invalid:
-        text = text.replace(ch, "_")
-    return text
-
-
-def safe_backup_path(original: Path, group: GroupInfo) -> Path:
-    parts = original.resolve().parts
-    mods_index = parts.index("Mods")
-
-    group_name = safe_folder_name(group.name)
-    group_time = datetime.fromtimestamp(group.created_at).strftime("%Y-%m-%d_%H-%M-%S")
-    group_folder = f"group{group.id}_{group_name}_{group_time}"
-
-    return BACKUP_DIR / group_folder / Path(*parts[mods_index:])
-
-
 def delete_file(path: Path, group: GroupInfo) -> bool:
     try:
         if get_config()["move_deleted_files_to_backup"]:
@@ -532,6 +584,7 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
     
     remaining_old_groups = [g for g in groups if g.id != group_id]
     return refresh_groups(get_mods_path(), remaining_old_groups)
+# endregion
 
 
 def show_menu() -> None:
