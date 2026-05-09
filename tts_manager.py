@@ -440,16 +440,29 @@ def rename_group(groups: list[GroupInfo]) -> None:
     print("已保存分组名称。")
 
 
-def safe_backup_path(original: Path) -> Path:
+def safe_folder_name(text: str) -> str:
+    text = text.strip() or "unnamed"
+    invalid = '<>:"/\\|?*'
+    for ch in invalid:
+        text = text.replace(ch, "_")
+    return text
+
+
+def safe_backup_path(original: Path, group: GroupInfo) -> Path:
     parts = original.resolve().parts
     mods_index = parts.index("Mods")
-    return BACKUP_DIR / Path(*parts[mods_index:])
+
+    group_name = safe_folder_name(group.name)
+    group_time = datetime.fromtimestamp(group.created_at).strftime("%Y-%m-%d_%H-%M-%S")
+    group_folder = f"group{group.id}_{group_name}_{group_time}"
+
+    return BACKUP_DIR / group_folder / Path(*parts[mods_index:])
 
 
-def delete_file(path: Path) -> bool:
+def delete_file(path: Path, group: GroupInfo) -> bool:
     try:
         if get_config()["move_deleted_files_to_backup"]:
-            target = safe_backup_path(path)
+            target = safe_backup_path(path, group)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(target))
         else:
@@ -474,10 +487,10 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
     print(f"将删除分组 [{group.id}] 名称：{name}，文件数：{len(group.files)}")
 
     confirm = input(
-        "确认删除该分组内所有文件吗？此操作不可轻易撤销。(输入 DELETE 确认)："
+        "确认删除该分组内所有文件吗？此操作不可轻易撤销。(输入 Y 确认)："
     ).strip()
 
-    if confirm.upper() != "DELETE":
+    if confirm.upper() != "Y":
         print("已取消删除。")
         return groups
 
@@ -488,7 +501,7 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
         if not path.is_file():
             continue
 
-        if delete_file(path):
+        if delete_file(path, group):
             deleted += 1
         else:
             failed += 1
