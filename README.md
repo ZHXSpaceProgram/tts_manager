@@ -10,6 +10,7 @@
 使用方法：
 - exe：从 [Releases](https://github.com/ZHXSpaceProgram/tts_manager/releases) 下载
 - python：`python tts_manager.py`
+- [视频演示](https://www.bilibili.com/video/BV1q6RSB6EzP)
 
 注意事项：
 - 如果运行过 v1.x 的旧版软件，在运行 v2 版本软件前请删除 tts_manager_data.json，否则会报错 KeyError: 'json_path' 退出。
