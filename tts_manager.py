@@ -1,8 +1,9 @@
 import json
 import os
+import re
 import shutil
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -11,12 +12,10 @@ from PIL import Image, ImageTk
 import tkinter as tk
 
 # ===== 可置顶修改的变量 =====
+PREVIEW_IMAGE_COUNT = 15
 DEFAULT_CONFIG = {
-    "group_threshold_minutes": 60,
     "move_deleted_files_to_backup": True,
 }
-CACHE_FOLDERS = {"Images Raw", "Models Raw"}
-
 DATA_FILE_NAME = "tts_manager_data.json"
 BACKUP_DIR_NAME = "deleted_files_backup"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -26,7 +25,6 @@ IMAGE_WINDOWS = []  # 用于保持图片窗口的引用，防止被垃圾回收
 @dataclass
 class FileInfo:
     path: str
-    created_at: float
     top_level_folder: str
 
 
@@ -34,8 +32,8 @@ class FileInfo:
 class GroupInfo:
     id: int
     name: str
-    created_at: float
-    files: list[FileInfo]
+    json_path: str
+    files: list[FileInfo] = field(default_factory=list)
 
 
 def script_dir() -> Path:
@@ -52,14 +50,6 @@ BACKUP_DIR = BASE_DIR / BACKUP_DIR_NAME
 # region Time Handling ===================================================================
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def format_time(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def get_creation_time(path: Path) -> float:
-    return path.stat().st_birthtime if hasattr(path.stat(), "st_birthtime") else path.stat().st_ctime
 # endregion
 
 
@@ -85,34 +75,37 @@ def save_data(data: dict) -> None:
 
 def load_config() -> dict:
     data = load_data()
-    config = data.get("config", {})
+    raw_config = data.get("config", {})
+    config = {
+        key: raw_config.get(key, default_value)
+        for key, default_value in DEFAULT_CONFIG.items()
+    }
 
-    changed = False
-
-    for key, default_value in DEFAULT_CONFIG.items():
-        if key not in config:
-            config[key] = default_value
-            changed = True
-
-    if changed or "config" not in data:
+    if data.get("config") != config:
         data["config"] = config
         save_data(data)
 
     return config
 
 
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+
+    return bool(value)
+
+
 def get_config() -> dict:
     config = load_config()
     return {
-        "group_threshold_minutes": int(
+        "move_deleted_files_to_backup": to_bool(
             config.get(
-                "group_threshold_minutes",
-                DEFAULT_CONFIG["group_threshold_minutes"],
+                "move_deleted_files_to_backup",
+                DEFAULT_CONFIG["move_deleted_files_to_backup"],
             )
-        ),
-        "move_deleted_files_to_backup": config.get(
-            "move_deleted_files_to_backup",
-            DEFAULT_CONFIG["move_deleted_files_to_backup"],
         ),
     }
 # endregion
@@ -144,10 +137,7 @@ def normalize_mods_path(raw_path: str) -> Optional[Path]:
 
 def ask_mods_path() -> Path:
     while True:
-        raw = input(
-            "请输入 Tabletop Simulator_Data 路径："
-        )
-
+        raw = input("请输入 Tabletop Simulator_Data 路径：")
         mods_path = normalize_mods_path(raw)
 
         if mods_path is None:
@@ -187,10 +177,12 @@ def reset_mods_path() -> Path:
 
 
 # region File Helpers ==================================================================
-
-
-def file_identity(file: FileInfo) -> str:
-    return os.path.normcase(os.path.abspath(file.path))
+def file_identity(file: FileInfo | Path | str) -> str:
+    if isinstance(file, FileInfo):
+        raw_path = file.path
+    else:
+        raw_path = str(file)
+    return os.path.normcase(os.path.abspath(raw_path))
 
 
 def safe_folder_name(text: str) -> str:
@@ -201,14 +193,18 @@ def safe_folder_name(text: str) -> str:
     return text
 
 
+def path_contains_workshop(path: Path) -> bool:
+    return any(part.lower() == "workshop" for part in path.parts)
+
+
 def scan_files(mods_path: Path) -> list[FileInfo]:
     files: list[FileInfo] = []
 
-    for top in mods_path.iterdir():
-        if not top.is_dir() or top.name in CACHE_FOLDERS:
+    for top in sorted(mods_path.iterdir(), key=lambda p: p.name.lower()):
+        if not top.is_dir():  # 包含缓存文件
             continue
 
-        for item in top.rglob("*"):
+        for item in sorted(top.rglob("*"), key=lambda p: str(p).lower()):
             if not item.is_file():
                 continue
 
@@ -216,55 +212,159 @@ def scan_files(mods_path: Path) -> list[FileInfo]:
                 files.append(
                     FileInfo(
                         path=str(item.resolve()),
-                        created_at=get_creation_time(item),
                         top_level_folder=top.name,
                     )
                 )
             except OSError:
                 print(f"警告：无法读取文件信息，已跳过：{item}")
 
-    return sorted(files, key=lambda f: f.created_at)
+    return files
 
 
-def safe_backup_path(original: Path, group: GroupInfo) -> Path:
+def find_workshop_json_files(files: list[FileInfo]) -> list[Path]:
+    json_files = [
+        Path(file.path)
+        for file in files
+        if Path(file.path).suffix.lower() == ".json"
+        and Path(file.path).name != "WorkshopFileInfos.json"
+        and path_contains_workshop(Path(file.path))
+    ]
+    return sorted(json_files, key=lambda p: str(p).lower())
+
+
+def index_files_by_stem(files: list[FileInfo]) -> dict[str, list[FileInfo]]:
+    index: dict[str, list[FileInfo]] = {}
+
+    for file in files:
+        path = Path(file.path)
+        index.setdefault(path.stem, []).append(file)
+
+    return index
+
+
+def url_to_cache_stem(url: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", url)
+
+
+def extract_urls_from_text(text: str) -> list[str]:
+    normalized_text = text.replace(r"\/", "/")
+    urls = re.findall(r"https?://[^\s\"'<>]+", normalized_text)
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for url in urls:
+        clean_url = url.rstrip("),.;]")
+        if clean_url and clean_url not in seen:
+            result.append(clean_url)
+            seen.add(clean_url)
+
+    return result
+
+
+def find_same_name_workshop_image(json_path: Path) -> Optional[Path]:
+    if not path_contains_workshop(json_path) or not json_path.parent.is_dir():
+        return None
+
+    for item in json_path.parent.iterdir():
+        if not item.is_file():
+            continue
+        if item.stem == json_path.stem and item.suffix.lower() in IMAGE_EXTENSIONS:
+            return item.resolve()
+
+    return None
+
+
+def add_file_once(files: list[FileInfo], file: FileInfo, seen_paths: set[str]) -> None:
+    identity = file_identity(file)
+    if identity in seen_paths:
+        return
+    files.append(file)
+    seen_paths.add(identity)
+
+
+def top_level_folder_from_path(mods_path: Path, path: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(mods_path.resolve())
+    except ValueError:
+        return ""
+    return relative.parts[0] if relative.parts else ""
+
+
+def file_info_from_path(mods_path: Path, path: Path) -> FileInfo:
+    return FileInfo(
+        path=str(path.resolve()),
+        top_level_folder=top_level_folder_from_path(mods_path, path),
+    )
+
+
+def mods_relative_path(original: Path) -> Path:
     parts = original.resolve().parts
-    mods_index = parts.index("Mods")
 
-    group_name = safe_folder_name(group.name)
-    group_time = datetime.fromtimestamp(group.created_at).strftime("%Y-%m-%d_%H-%M-%S")
-    group_folder = f"group{group.id}_{group_name}_{group_time}"
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].lower() == "mods":
+            return Path(*parts[index:])
 
-    return BACKUP_DIR / group_folder / Path(*parts[mods_index:])
+    return Path(original.name)
+
+
+def make_backup_group_dir(group: GroupInfo) -> Path:
+    group_name = safe_folder_name(group.name or Path(group.json_path).stem)
+    delete_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    group_folder = f"group{group.id}_{group_name}_{delete_time}"
+
+    return BACKUP_DIR / group_folder
+
+
+def safe_backup_path(original: Path, backup_group_dir: Path) -> Path:
+    return backup_group_dir / mods_relative_path(original)
 # endregion
 
 
 # region Grouping Logic ==================================================================
-def make_group(group_id: int, files: list[FileInfo]) -> GroupInfo:
+def make_group(
+    group_id: int,
+    json_path: Path,
+    file_index: dict[str, list[FileInfo]],
+    mods_path: Path,
+) -> GroupInfo:
+    group_files: list[FileInfo] = []
+    seen_paths: set[str] = set()
+
+    add_file_once(group_files, file_info_from_path(mods_path, json_path), seen_paths)
+
+    cover_image = find_same_name_workshop_image(json_path)
+    if cover_image is not None:
+        add_file_once(group_files, file_info_from_path(mods_path, cover_image), seen_paths)
+
+    try:
+        text = json_path.read_text(encoding="utf-8-sig", errors="ignore")
+    except Exception as exc:
+        print(f"警告：读取 Workshop JSON 失败，已跳过 URL 收集：{json_path} | {exc}")
+        text = ""
+
+    for url in extract_urls_from_text(text):
+        stem = url_to_cache_stem(url)
+        for file in file_index.get(stem, []):
+            add_file_once(group_files, file, seen_paths)
+
     return GroupInfo(
         id=group_id,
         name="",
-        created_at=min(f.created_at for f in files),
-        files=files,
+        json_path=str(json_path.resolve()),
+        files=group_files,
     )
 
 
-def build_groups(files: list[FileInfo]) -> list[GroupInfo]:
-    if not files:
-        return []
+def build_groups(mods_path: Path) -> list[GroupInfo]:
+    files = scan_files(mods_path)
+    file_index = index_files_by_stem(files)
+    json_files = find_workshop_json_files(files)
 
-    threshold = get_config()["group_threshold_minutes"] * 60
     groups: list[GroupInfo] = []
-    current = [files[0]]
+    for index, json_path in enumerate(json_files, start=1):
+        groups.append(make_group(index, json_path, file_index, mods_path))
 
-    for file in files[1:]:
-        # 要求：当前分组最早文件 到 新文件 的时差不超过阈值
-        if file.created_at - current[0].created_at <= threshold:
-            current.append(file)
-        else:
-            groups.append(make_group(len(groups) + 1, current))
-            current = [file]
-
-    groups.append(make_group(len(groups) + 1, current))
     return groups
 
 
@@ -272,10 +372,8 @@ def group_to_dict(group: GroupInfo) -> dict:
     return {
         "id": group.id,
         "name": group.name,
-        "created_at": group.created_at,
-        "created_at_text": format_time(group.created_at),
+        "json_path": group.json_path,
         "file_count": len(group.files),
-        "files": [asdict(f) for f in group.files],
     }
 
 
@@ -283,15 +381,7 @@ def group_from_dict(raw: dict) -> GroupInfo:
     return GroupInfo(
         id=int(raw["id"]),
         name=raw.get("name", ""),
-        created_at=float(raw["created_at"]),
-        files=[
-            FileInfo(
-                path=f["path"],
-                created_at=float(f["created_at"]),
-                top_level_folder=f.get("top_level_folder", ""),
-            )
-            for f in raw.get("files", [])
-        ],
+        json_path=raw["json_path"],
     )
 
 
@@ -306,58 +396,31 @@ def save_groups(groups: list[GroupInfo]) -> None:
 
 
 def carry_names(old_groups: list[GroupInfo], new_groups: list[GroupInfo]) -> None:
-    named_old = [g for g in old_groups if g.name.strip()]
-    used_old_ids = set()
+    old_name_by_json_path = {
+        file_identity(old.json_path): old.name
+        for old in old_groups
+        if old.name.strip() and old.json_path.strip()
+    }
 
     for new in new_groups:
-        new_files = {file_identity(f) for f in new.files}
-        best: Optional[GroupInfo] = None
-        best_overlap = 0
-
-        for old in named_old:
-            if old.id in used_old_ids:
-                continue
-
-            overlap = len(new_files & {file_identity(f) for f in old.files})
-            if overlap > best_overlap:
-                best = old
-                best_overlap = overlap
-
-        if best and best_overlap > 0:
-            new.name = best.name
-            used_old_ids.add(best.id)
+        old_name = old_name_by_json_path.get(file_identity(new.json_path), "")
+        if old_name.strip():
+            new.name = old_name
 
 
-def extract_save_name_from_group(group: GroupInfo) -> str:
-    """
-    从 group 文件中，寻找 mods 路径下 Workshop 子文件夹内的 json 文件，
-    尝试读取其中的 SaveName 字段作为分组名称。
-    """
-    candidates: list[Path] = []
-    for file in group.files:
-        path = Path(file.path)
-        if path.suffix.lower() != ".json":
-            continue
-        # 只接受 Workshop 下的 json 文件
-        parts = path.parts
-        if "Workshop" not in parts:
-            continue
-        candidates.append(path)
+def extract_game_mode_from_json(json_path: str) -> str:
+    path = Path(json_path)
 
-    # 优先读取创建时间最早的 json，避免同组多个 json 时结果不稳定
-    candidates.sort(key=lambda p: get_creation_time(p) if p.exists() else 0)
-
-    for json_path in candidates:
-        try:
-            with json_path.open("r", encoding="utf-8-sig") as f:
-                raw = json.load(f)
-            if not isinstance(raw, dict):
-                continue
-            save_name = raw.get("SaveName", "")
-            if isinstance(save_name, str) and save_name.strip():
-                return save_name.strip()
-        except Exception as exc:
-            print(f"警告：读取 Workshop JSON 失败，已跳过：{json_path} | {exc}")
+    try:
+        with path.open("r", encoding="utf-8-sig") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return ""
+        game_mode = raw.get("GameMode", "")
+        if isinstance(game_mode, str) and game_mode.strip():
+            return game_mode.strip()
+    except Exception as exc:
+        print(f"警告：读取 GameMode 失败，已跳过：{path} | {exc}")
 
     return ""
 
@@ -366,16 +429,16 @@ def auto_name_unnamed_groups(groups: list[GroupInfo]) -> None:
     for group in groups:
         if group.name.strip():
             continue
-        save_name = extract_save_name_from_group(group)
-        if save_name:
-            group.name = save_name
+        game_mode = extract_game_mode_from_json(group.json_path)
+        if game_mode:
+            group.name = game_mode
 
 
 def refresh_groups(
     mods_path: Path,
     old_groups: Optional[list[GroupInfo]] = None,
 ) -> list[GroupInfo]:
-    groups = build_groups(scan_files(mods_path))
+    groups = build_groups(mods_path)
 
     if old_groups:
         carry_names(old_groups, groups)
@@ -406,36 +469,62 @@ def input_group_id(groups: list[GroupInfo]) -> Optional[int]:
     return group_id
 
 
-def display_groups(groups: list[GroupInfo]) -> None:
+def display_groups(groups: list[GroupInfo], mods_path: Path) -> None:
     print("\n========== 当前分组 ==========")
 
     if not groups:
-        print("没有找到可分组文件。")
+        print("没有找到文件，无法生成分组。")
     else:
         for group in groups:
             name = group.name.strip() or "（空白）"
+            json_name = Path(group.json_path).name if group.json_path else "无"
+
             print(
                 f"[{group.id}] 名称：{name} | "
-                f"创建时间：{format_time(group.created_at)} | "
+                f"JSON：{json_name} | "
                 f"文件数：{len(group.files)}"
             )
 
     print("==============================")
-    print(f"文件路径：{get_mods_path()}\n")
+    print(f"文件路径：{mods_path}\n")
 
 
-def show_images_in_group(group: GroupInfo) -> None:
+def select_preview_images(group: GroupInfo, max_count: int = PREVIEW_IMAGE_COUNT) -> list[Path]:
     image_files = [
         Path(file.path)
         for file in group.files
         if Path(file.path).suffix.lower() in IMAGE_EXTENSIONS
+        and Path(file.path).is_file()
     ]
 
     if not image_files:
+        return []
+
+    cover_image = find_same_name_workshop_image(Path(group.json_path))
+    selected: list[Path] = []
+    selected_paths: set[str] = set()
+
+    if cover_image is not None and cover_image.is_file():
+        selected.append(cover_image)
+        selected_paths.add(file_identity(cover_image))
+
+    rest = [
+        path for path in image_files
+        if file_identity(path) not in selected_paths
+    ]
+
+    remaining_count = max(0, max_count - len(selected))
+    selected.extend(random.sample(rest, min(remaining_count, len(rest))))
+
+    return selected
+
+
+def show_images_in_group(group: GroupInfo, image_files: list[Path]) -> None:
+    selected = image_files[:PREVIEW_IMAGE_COUNT]
+
+    if not selected:
         print("该分组中没有找到图片文件。")
         return
-
-    selected = random.sample(image_files, min(15, len(image_files)))
 
     if tk._default_root is None:
         root = tk.Tk()
@@ -472,25 +561,34 @@ def display_files(groups: list[GroupInfo]) -> None:
         return
 
     group = find_group(groups, group_id)
-    
-    show_images_in_group(group)
+    if not group:
+        return
+
+    preview_images = select_preview_images(group, PREVIEW_IMAGE_COUNT)
+    show_images_in_group(group, preview_images)
+
+    print("========== Workshop JSON ===========")
+    for index, image_path in enumerate(preview_images, start=1):
+        print(f"[{index}] {image_path}")
 
     print("========== 图片文件 ===========")
     count = 0
     for file in group.files:
         if Path(file.path).suffix.lower() in IMAGE_EXTENSIONS:
             count += 1
-            if count > 20:
+            if count > PREVIEW_IMAGE_COUNT:
                 print("...")
                 break
             print(f"[{count}] {file.path}")
+
     print("========== 其他文件 ===========")
     count = 0
     for file in group.files:
-        if Path(file.path).suffix.lower() in IMAGE_EXTENSIONS | {".obj", ".fbx"}:
+        suffix = Path(file.path).suffix.lower()
+        if suffix in IMAGE_EXTENSIONS | {".obj", ".fbx", ".unity3d", ".rawt", ".rawm"}:
             continue
         count += 1
-        if count > 20:
+        if count > PREVIEW_IMAGE_COUNT:
             print("...")
             break
         print(f"[{count}] {file.path}")
@@ -507,14 +605,25 @@ def rename_group(groups: list[GroupInfo]) -> None:
         return
 
     group.name = input("请输入新的分组名称，留空表示清除名称：").strip()
+
+    if not group.name:
+        group.name = extract_game_mode_from_json(group.json_path)
+
     save_groups(groups)
     print("已保存分组名称。")
 
 
-def delete_file(path: Path, group: GroupInfo) -> bool:
+def delete_file(
+    path: Path,
+    move_to_backup: bool,
+    backup_group_dir: Optional[Path],
+) -> bool:
     try:
-        if get_config()["move_deleted_files_to_backup"]:
-            target = safe_backup_path(path, group)
+        if move_to_backup:
+            if backup_group_dir is None:
+                raise ValueError("backup_group_dir 不能为空")
+
+            target = safe_backup_path(path, backup_group_dir)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(target))
         else:
@@ -524,19 +633,6 @@ def delete_file(path: Path, group: GroupInfo) -> bool:
     except Exception as exc:
         print(f"删除失败：{path} | {exc}")
         return False
-
-
-def clear_cache_folders(mods_path: Path) -> None:
-    for folder_name in CACHE_FOLDERS:
-        folder = mods_path / folder_name
-        if not folder.exists():
-            continue
-        try:
-            shutil.rmtree(folder)
-            folder.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            print(f"清空缓存失败：{folder} | {exc}")
-    print("缓存已清空。")
 
 
 def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
@@ -549,11 +645,10 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
         return groups
 
     name = group.name.strip() or "（空白）"
-    print(f"将删除分组 [{group.id}] 名称：{name}，文件数：{len(group.files)}")
+    json_name = Path(group.json_path).name if group.json_path else "无"
+    print(f"将删除分组 [{group.id}] 名称：{name}，JSON：{json_name}，文件数：{len(group.files)}")
 
-    confirm = input(
-        "确认删除该分组内所有文件吗？(输入 Y 确认)："
-    ).strip()
+    confirm = input("确认删除该分组内所有文件吗？(输入 Y 确认)：").strip()
 
     if confirm.upper() != "Y":
         print("已取消删除。")
@@ -561,27 +656,35 @@ def delete_group_files(groups: list[GroupInfo]) -> list[GroupInfo]:
 
     deleted = failed = 0
 
+    move_to_backup = get_config()["move_deleted_files_to_backup"]
+    backup_group_dir = make_backup_group_dir(group) if move_to_backup else None
+
+    # 收集其他分组中的文件路径，以避免误删被多个分组引用的文件
+    other_group_file_paths = {
+    file_identity(file)
+    for other_group in groups
+    if other_group.id != group.id
+    for file in other_group.files
+    }
+    
+    skipped_shared = 0
     for file in group.files:
+        # 如果其他分组也引用了这个文件，就跳过删除
+        if file_identity(file) in other_group_file_paths:
+            skipped_shared += 1
+            continue
+
         path = Path(file.path)
         if not path.is_file():
             continue
 
-        if delete_file(path, group):
+        if delete_file(path, move_to_backup, backup_group_dir):
             deleted += 1
         else:
             failed += 1
 
-    print(f"删除完成。成功：{deleted}，失败：{failed}")
+    print(f"删除完成。成功：{deleted}，失败：{failed}，跳过共享文件：{skipped_shared}")
 
-    confirm_clear_cache = input(
-        "是否清空缓存文件夹 Images Raw / Models Raw 内的内容？(输入 Y 确认)："
-    ).strip()
-
-    if confirm_clear_cache.upper() == "Y":
-        clear_cache_folders(get_mods_path())
-    else:
-        print("已跳过清空缓存。")
-    
     remaining_old_groups = [g for g in groups if g.id != group_id]
     return refresh_groups(get_mods_path(), remaining_old_groups)
 # endregion
@@ -606,7 +709,7 @@ def main() -> None:
     groups = refresh_groups(mods_path, load_groups())
 
     while True:
-        display_groups(groups)
+        display_groups(groups, mods_path)
         show_menu()
         command = input("请输入命令：").strip().lower()
 
@@ -619,7 +722,7 @@ def main() -> None:
 
         elif command in ("n", "name"):
             rename_group(groups)
-        
+
         elif command in ("d", "delete"):
             groups = delete_group_files(groups)
 
